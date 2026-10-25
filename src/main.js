@@ -4472,7 +4472,7 @@ function renderEditDashboard() {
       <div class="people-editor-empty" id="people-editor-empty" hidden>Žádný člen neodpovídá hledání.</div>
     </article>
     <article class="editor-card editor-wide spreadsheet-card">
-      <div class="editor-head"><div><span class="eyebrow">Hromadné doplnění</span><h2>Import lidí z Excelu</h2></div><span class="count-badge">A–E</span></div>
+      <div class="editor-head"><div><span class="eyebrow">Hromadné doplnění</span><h2>Import z Excelu</h2></div><span class="count-badge">XLSX</span></div>
       <div class="spreadsheet-workflow">
         <button type="button" class="spreadsheet-dropzone" data-action="import-spreadsheet" data-import-kind="standard">
           <span class="dropzone-mark" aria-hidden="true">↥</span>
@@ -4488,6 +4488,14 @@ function renderEditDashboard() {
         </button>
         <div class="spreadsheet-copy"><b>Vlastní export SKAUTIS</b><p>Načtou se sloupce A–E a hlavní e-mail ze sloupce I. Datum narození se uloží k osobě, funkce jako role, kvalifikace jako štítky oddělené čárkami a jednotka jako přiřazení.</p><span>Osoba · Datum narození · Funkce · Kvalifikace · Jednotka · E-mail (hlavní)</span></div>
         <input id="custom-skautis-file" type="file" multiple accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden>
+      </div>
+      <div class="spreadsheet-workflow">
+        <button type="button" class="spreadsheet-dropzone" data-action="import-tag-matrix" data-import-kind="tag-matrix">
+          <span class="dropzone-mark" aria-hidden="true">#</span>
+          <span><b>Kurzy a kvalifikace</b><small>Přetáhněte .xlsx nebo klikněte</small></span>
+        </button>
+        <div class="spreadsheet-copy"><b>Vytvořit a přiřadit štítky</b><p>Sloupec B určuje název štítku. Druhý řádek s roky se ignoruje; od sloupce C se načtou jména ze seznamů s odrážkami. Před uložením uvidíte nalezené i nerozpoznané lidi.</p><span>B = štítek · řádek 2 = ignorovat · C a dále = lidé</span></div>
+        <input id="tag-matrix-file" type="file" multiple accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden>
       </div>
     </article>
     <article class="editor-card editor-wide database-card">
@@ -4954,6 +4962,101 @@ async function parseCustomSkautisFiles(files) {
   return [...merged.values()];
 }
 
+function parseTagMatrixNames(value) {
+  const text = String(value ?? "").replace(/\r/g, "\n").trim();
+  if (!text) return [];
+  return text
+    .replace(/[•▪◦‣·●○■□►▸➤✓✔]\s*/g, "\n")
+    .split(/\n+/)
+    .map(name => name
+      .replace(/^\s*(?:[-–—*·]+|\d+[.)])\s*/, "")
+      .replace(/\s+/g, " ")
+      .trim())
+    .filter(name => name
+      && !/^(?:[-–—.]{2,}|bez|nikdo)$/i.test(name)
+      && !/^(?:19|20)\d{2}$/.test(name));
+}
+
+function parseTagMatrixSheet(sheetRows, sheetName, fileName) {
+  const tagNames = [];
+  const entries = [];
+  sheetRows.forEach((row, rowIndex) => {
+    if (rowIndex === 1) return;
+    const tagName = String(row[1] ?? "").replace(/\s+/g, " ").trim();
+    if (!tagName) return;
+    tagNames.push(tagName);
+    row.slice(2).flatMap(parseTagMatrixNames).forEach(rawName => {
+      entries.push({
+        ...parseExportedName(rawName),
+        rawName,
+        tagName,
+        sourceFile: fileName,
+        sourceSheet: sheetName,
+        sourceRow: rowIndex + 1,
+      });
+    });
+  });
+  return {tagNames, entries};
+}
+
+async function parseTagMatrixFiles(files) {
+  const tagNames = [];
+  const entries = [];
+  for (const file of files) {
+    if (!/\.xlsx$/i.test(file.name)) throw new Error(`Soubor „${file.name}“ není Excel ve formátu .xlsx.`);
+    if (file.size > 20 * 1024 * 1024) throw new Error(`Soubor „${file.name}“ je větší než 20 MB.`);
+    const sheets = await readExcelFile(file);
+    sheets.forEach(sheet => {
+      const parsed = parseTagMatrixSheet(sheet.data, sheet.sheet, file.name);
+      tagNames.push(...parsed.tagNames);
+      entries.push(...parsed.entries);
+    });
+  }
+  const uniqueTags = detailedUniqueValues(tagNames);
+  const uniqueEntries = new Map();
+  entries.forEach(entry => {
+    const key = `${normalizeImportText(entry.tagName)}|${normalizeImportText(entry.rawName)}`;
+    if (!uniqueEntries.has(key)) uniqueEntries.set(key, entry);
+  });
+  return {tagNames: uniqueTags, entries: [...uniqueEntries.values()]};
+}
+
+function matchTagMatrixPerson(entry) {
+  const regularMatch = matchImportedPerson(entry);
+  if (regularMatch) return regularMatch;
+  const nameKey = normalizeImportText(entry.rawName);
+  const nicknameMatches = people.filter(person => nameKey && normalizeImportText(person.nickname) === nameKey);
+  return nicknameMatches.length === 1 ? {person: nicknameMatches[0], score: 95} : null;
+}
+
+function personHasTag(personId, tagName) {
+  const person = people.find(item => item.id === +personId);
+  const tagKey = normalizeImportText(tagName);
+  return Boolean(person && tagKey && person.tagsArray.some(tag => normalizeImportText(tag) === tagKey));
+}
+
+function prepareTagMatrixImport(parsed, fileNames) {
+  const stagedRows = [];
+  const seenAssignments = new Set();
+  parsed.entries.forEach((entry, index) => {
+    const match = matchTagMatrixPerson(entry);
+    const matchId = match?.person.id ?? null;
+    const assignmentKey = matchId == null ? "" : `${normalizeImportText(entry.tagName)}|${matchId}`;
+    if (assignmentKey && seenAssignments.has(assignmentKey)) return;
+    if (assignmentKey) seenAssignments.add(assignmentKey);
+    const alreadyAssigned = matchId != null && personHasTag(matchId, entry.tagName);
+    stagedRows.push({
+      ...entry,
+      id: index + 1,
+      matchId,
+      matchScore: match?.score ?? 0,
+      alreadyAssigned,
+      selected: matchId != null && !alreadyAssigned,
+    });
+  });
+  spreadsheetImportState = {kind: "tag-matrix", rows: stagedRows, tagNames: parsed.tagNames, fileNames};
+}
+
 function prepareSpreadsheetImport(rows, fileNames, kind = "standard") {
   const stagedRows = rows.map((row, index) => {
     const match = matchImportedPerson(row);
@@ -4986,9 +5089,65 @@ function importedUnitLabel(row) {
   return [...new Set(row.assignments.map(assignment => assignment.name).filter(Boolean))].join(" · ");
 }
 
+function tagMatrixPersonOptions() {
+  return [...people]
+    .sort((a, b) => personName(a).localeCompare(personName(b), "cs"))
+    .map(person => {
+      const label = `${personName(person)}${person.nickname ? ` (${person.nickname})` : ""}${person.org_team ? ` · ${person.org_team}` : ""}`;
+      return `<option value="${escapeHtml(label)}" data-person-id="${person.id}"></option>`;
+    })
+    .join("");
+}
+
+function selectedTagMatrixAssignments() {
+  if (!spreadsheetImportState || spreadsheetImportState.kind !== "tag-matrix") return [];
+  const unique = new Map();
+  spreadsheetImportState.rows
+    .filter(row => row.selected && row.matchId != null && !row.alreadyAssigned)
+    .forEach(row => unique.set(`${normalizeImportText(row.tagName)}|${row.matchId}`, row));
+  return [...unique.values()];
+}
+
+function renderTagMatrixReview(target) {
+  const state = spreadsheetImportState;
+  const existingTagKeys = new Set(tagsData.map(tag => normalizeImportText(tag.name)));
+  const newTagCount = state.tagNames.filter(tag => !existingTagKeys.has(normalizeImportText(tag))).length;
+  const matched = state.rows.filter(row => row.matchId != null);
+  const unmatched = state.rows.filter(row => row.matchId == null);
+  const ready = state.rows.filter(row => row.selected && row.matchId != null && !row.alreadyAssigned).length;
+  const alreadyAssigned = state.rows.filter(row => row.alreadyAssigned).length;
+  document.querySelector("#spreadsheet-modal-title").textContent = "Import štítků z tabulky";
+  target.innerHTML = `
+    <div class="import-summary">
+      <div><span class="eyebrow">Kurzy a kvalifikace · ${state.fileNames.map(escapeHtml).join(" · ")}</span><h3>${state.tagNames.length} štítků · ${state.rows.length} záznamů lidí</h3><p>Druhý řádek s roky byl vynechán. ${matched.length} jmen se podařilo spojit s mapou, ${unmatched.length} čeká na ruční přiřazení. Duplicitní štítky ani vazby se nevytvoří.</p></div>
+      <div class="tag-import-totals"><b>${newTagCount}</b><span>nových štítků</span><b id="tag-import-ready-count">${ready}</b><span>nových přiřazení</span></div>
+    </div>
+    <section class="tag-import-section">
+      <div class="review-section-head"><div><span class="eyebrow">Nalezeno ve sloupci B</span><h3>Štítky</h3></div><span class="count-badge">${state.tagNames.length}</span></div>
+      <div class="tag-import-chips">${state.tagNames.map(tag => `<span>#${escapeHtml(tag)}</span>`).join("")}</div>
+    </section>
+    <section class="tag-import-section">
+      <div class="review-section-head"><div><span class="eyebrow">Připraveno k přiřazení</span><h3>Nalezení lidé</h3></div><span class="count-badge">${matched.length}</span></div>
+      ${matched.length ? `<div class="tag-import-list">${matched.map(row => {
+        const person = people.find(item => item.id === row.matchId);
+        return `<label class="tag-import-row${row.alreadyAssigned ? " is-existing" : ""}" data-tag-import-row="${row.id}"><input type="checkbox" data-tag-import-select${row.selected ? " checked" : ""}${row.alreadyAssigned ? " disabled" : ""}><span><b>${escapeHtml(row.rawName)} → ${escapeHtml(personName(person))}</b><small>#${escapeHtml(row.tagName)} · ${row.alreadyAssigned ? "už přiřazeno" : row.matchScore === 100 ? "přesná shoda" : row.matchScore === 95 ? "shoda přezdívky" : "podobné jméno"}</small></span></label>`;
+      }).join("")}</div>` : '<div class="empty-line">Žádné jméno nebylo automaticky nalezeno.</div>'}
+      ${alreadyAssigned ? `<p class="tag-import-note">${alreadyAssigned} ${alreadyAssigned === 1 ? "vazba už existuje" : "vazeb už existuje"} a nebude se přidávat znovu.</p>` : ""}
+    </section>
+    ${unmatched.length ? `<section class="tag-import-section"><div class="review-section-head"><div><span class="eyebrow">Bez bezpečné shody</span><h3>Ruční přiřazení</h3></div><span class="count-badge">${unmatched.length}</span></div>
+      <p class="tag-import-help">Vyberte existujícího člověka, nebo ponechte řádek bez přiřazení. Import z tohoto souboru nevytváří nové neúplné osoby.</p>
+      <datalist id="tag-import-person-options">${tagMatrixPersonOptions()}</datalist>
+      <div class="tag-import-unmatched">${unmatched.map(row => `<div class="tag-import-map-row" data-tag-import-row="${row.id}"><span><b>${escapeHtml(row.rawName)}</b><small>#${escapeHtml(row.tagName)} · ${escapeHtml(row.sourceSheet)} · řádek ${row.sourceRow}</small></span><input type="search" list="tag-import-person-options" data-tag-import-person placeholder="Hledat člověka…" autocomplete="off" aria-label="Přiřadit ${escapeHtml(row.rawName)}"><em data-tag-import-state>Nepřiřazeno</em></div>`).join("")}</div>
+    </section>` : ""}
+    <div class="import-review-actions"><button type="button" class="secondary-button" data-import-action="cancel">Zrušit</button><span id="import-resolution-status"></span><button type="button" class="primary-button" data-import-action="save">Uložit štítky</button></div>`;
+  updateImportReviewStatus();
+}
+
 function renderSpreadsheetReview() {
   const target = document.querySelector("#spreadsheet-review");
   if (!target || !spreadsheetImportState) return;
+  if (spreadsheetImportState.kind === "tag-matrix") return renderTagMatrixReview(target);
+  document.querySelector("#spreadsheet-modal-title").textContent = "Porovnání tabulky";
   const customSkautis = spreadsheetImportState.kind === "custom-skautis";
   const rows = spreadsheetImportState.rows;
   const conflicts = rows.filter(row => row.matchId);
@@ -5028,6 +5187,21 @@ function renderSpreadsheetReview() {
 
 function updateImportReviewStatus() {
   if (!spreadsheetImportState) return;
+  if (spreadsheetImportState.kind === "tag-matrix") {
+    const existingTagKeys = new Set(tagsData.map(tag => normalizeImportText(tag.name)));
+    const newTags = spreadsheetImportState.tagNames.filter(tag => !existingTagKeys.has(normalizeImportText(tag))).length;
+    const selected = selectedTagMatrixAssignments().length;
+    const status = document.querySelector("#import-resolution-status");
+    const save = document.querySelector('[data-import-action="save"]');
+    const readyCount = document.querySelector("#tag-import-ready-count");
+    if (readyCount) readyCount.textContent = selected;
+    if (status) status.textContent = `${newTags} nových štítků · ${selected} nových přiřazení`;
+    if (save) {
+      save.disabled = newTags === 0 && selected === 0;
+      save.textContent = newTags || selected ? "Uložit štítky" : "Vše už je uložené";
+    }
+    return;
+  }
   const pending = spreadsheetImportState.rows.filter(row => row.matchId && row.action === "pending").length;
   const selected = spreadsheetImportState.rows.filter(row => row.action === "create" || row.action === "merge" || row.action === "edit").length;
   const status = document.querySelector("#import-resolution-status");
@@ -5076,6 +5250,22 @@ async function handleCustomSkautisFiles(fileList) {
   } catch (error) {
     spreadsheetImportState = null;
     showToast(`Custom SKAUTIS nelze načíst: ${error.message}`);
+  }
+}
+
+async function handleTagMatrixFiles(fileList) {
+  const files = [...fileList];
+  if (!files.length) return;
+  try {
+    showToast("Načítám kvalifikace a porovnávám jména…");
+    const parsed = await parseTagMatrixFiles(files);
+    if (!parsed.tagNames.length) throw new Error("Ve sloupci B jsem nenašel žádné názvy štítků.");
+    if (!parsed.entries.length) throw new Error("Od sloupce C jsem nenašel žádná jména v seznamech s odrážkami.");
+    prepareTagMatrixImport(parsed, files.map(file => file.name));
+    openSpreadsheetReview();
+  } catch (error) {
+    spreadsheetImportState = null;
+    showToast(`Kvalifikace nelze načíst: ${error.message}`);
   }
 }
 
@@ -5129,6 +5319,7 @@ function ensureImportedTeam(assignment) {
 
 async function saveSpreadsheetImport() {
   if (!spreadsheetImportState) return;
+  if (spreadsheetImportState.kind === "tag-matrix") return saveTagMatrixImport();
   const customSkautis = spreadsheetImportState.kind === "custom-skautis";
   const selectedRows = spreadsheetImportState.rows.filter(row => ["create", "merge", "edit"].includes(row.action));
   if (spreadsheetImportState.rows.some(row => row.matchId && row.action === "pending") || !selectedRows.length) return;
@@ -5199,6 +5390,31 @@ async function saveSpreadsheetImport() {
   }
 }
 
+async function saveTagMatrixImport() {
+  if (!spreadsheetImportState || spreadsheetImportState.kind !== "tag-matrix") return;
+  const state = spreadsheetImportState;
+  const assignments = selectedTagMatrixAssignments();
+  const existingTagKeys = new Set(tagsData.map(tag => normalizeImportText(tag.name)));
+  const newTagCount = state.tagNames.filter(tag => !existingTagKeys.has(normalizeImportText(tag))).length;
+  if (!newTagCount && !assignments.length) return;
+  persistWorkspaceState(true);
+  try {
+    runTransaction(() => {
+      const tagIds = new Map();
+      state.tagNames.forEach(tagName => tagIds.set(normalizeImportText(tagName), ensureImportedTag(tagName)));
+      assignments.forEach(row => {
+        const tagId = tagIds.get(normalizeImportText(row.tagName)) ?? ensureImportedTag(row.tagName);
+        if (tagId != null) db.run("INSERT OR IGNORE INTO people_tags (person_id,tag_id) VALUES (?,?)", [row.matchId, tagId]);
+      });
+    });
+    document.querySelector("#spreadsheet-modal").classList.remove("open");
+    spreadsheetImportState = null;
+    await refreshEditedData(`Import kvalifikací je uložený: ${newTagCount} nových štítků a ${assignments.length} přiřazení.`);
+  } catch (error) {
+    showToast(`Štítky se nepodařilo uložit: ${error.message}`);
+  }
+}
+
 async function handleEditorSubmit(event) {
   const form = event.target.closest("[data-editor-form]");
   if (!form) return;
@@ -5252,6 +5468,7 @@ async function handleEditorClick(event) {
     if (action === "edit-person") return openPersonModal(+button.dataset.personId);
     if (action === "import-spreadsheet") return document.querySelector("#spreadsheet-file")?.click();
     if (action === "import-custom-skautis") return document.querySelector("#custom-skautis-file")?.click();
+    if (action === "import-tag-matrix") return document.querySelector("#tag-matrix-file")?.click();
     if (action === "import-database") return document.querySelector("#import-db-file").click();
     if (action === "export-database") return exportDatabase();
     if (action === "delete-team") {
@@ -6173,6 +6390,10 @@ function bindEvents() {
       handleCustomSkautisFiles(event.target.files);
       event.target.value = "";
     }
+    if (event.target.id === "tag-matrix-file") {
+      handleTagMatrixFiles(event.target.files);
+      event.target.value = "";
+    }
   });
   editDashboard.addEventListener("dragover", event => {
     const dropzone = event.target.closest(".spreadsheet-dropzone");
@@ -6188,6 +6409,7 @@ function bindEvents() {
     event.preventDefault();
     dropzone.classList.remove("is-dragging");
     if (dropzone.dataset.importKind === "custom-skautis") handleCustomSkautisFiles(event.dataTransfer.files);
+    else if (dropzone.dataset.importKind === "tag-matrix") handleTagMatrixFiles(event.dataTransfer.files);
     else handleSpreadsheetFiles(event.dataTransfer.files);
   });
   editDashboard.addEventListener("focusout", event => scheduleInlineAutosave(event.target, true));
@@ -6278,6 +6500,25 @@ function bindEvents() {
   document.querySelector("#spreadsheet-modal").addEventListener("change", event => {
     if (!spreadsheetImportState) return;
     const card = event.target.closest("[data-import-row]");
+    if (spreadsheetImportState.kind === "tag-matrix") {
+      const rowElement = event.target.closest("[data-tag-import-row]");
+      const row = rowElement ? spreadsheetImportState.rows.find(item => item.id === +rowElement.dataset.tagImportRow) : null;
+      if (!row) return;
+      if (event.target.matches("[data-tag-import-select]")) {
+        row.selected = event.target.checked;
+      } else if (event.target.matches("[data-tag-import-person]")) {
+        const choice = [...document.querySelectorAll("#tag-import-person-options option")].find(option => option.value === event.target.value);
+        row.matchId = choice ? +choice.dataset.personId : null;
+        row.alreadyAssigned = row.matchId != null && personHasTag(row.matchId, row.tagName);
+        row.selected = row.matchId != null && !row.alreadyAssigned;
+        const status = rowElement.querySelector("[data-tag-import-state]");
+        const person = people.find(item => item.id === row.matchId);
+        if (status) status.textContent = row.alreadyAssigned ? "Štítek už je přiřazen" : person ? `Přiřadit: ${personName(person)}` : "Nepřiřazeno";
+        rowElement.classList.toggle("is-existing", row.alreadyAssigned);
+      }
+      updateImportReviewStatus();
+      return;
+    }
     const row = card ? spreadsheetImportState.rows.find(item => item.id === +card.dataset.importRow) : null;
     if (!row) return;
     if (event.target.matches('input[type="radio"]')) {
