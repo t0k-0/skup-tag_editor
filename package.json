@@ -1,0 +1,22 @@
+{
+  "name": "mapa-strediska",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "d3": "^7.9.0",
+    "read-excel-file": "^9.3.12",
+    "sql.js": "^1.13.0",
+    "venn.js": "^0.2.20"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4",
+    "vite": "^7.1.7"
+  }
+}
