@@ -54,8 +54,14 @@ const seed = {
 };
 
 const app = document.querySelector("#app");
-const THEME_KEY = "mapa-strediska-theme";
-const APP_SETTINGS_KEY = "mapa-strediska-app-settings-v1";
+// GitHub Pages projects under the same account share one browser origin. Keep
+// the editor isolated from the read-only map so their settings, layouts and
+// SQLite snapshots can never overwrite one another.
+const EDITOR_STORAGE_PREFIX = "skup-tag-editor";
+const THEME_KEY = `${EDITOR_STORAGE_PREFIX}-theme`;
+const APP_SETTINGS_KEY = `${EDITOR_STORAGE_PREFIX}-app-settings-v1`;
+const EDITOR_DATABASE_NAME = `${EDITOR_STORAGE_PREFIX}-database`;
+const LEGACY_DATABASE_NAME = "mapa-strediska";
 const DEFAULT_APP_SETTINGS = {textScale: 1, background: "", reducedMotion: false};
 const themeMedia = window.matchMedia("(prefers-color-scheme: dark)");
 let themePreference = "system";
@@ -186,7 +192,7 @@ let workspaceSaveTimer;
 const editorAutosaveTimers = new Map();
 const editorAutosaveVersions = new WeakMap();
 let editorAutosaveQueue = Promise.resolve();
-const VIEW_STATE_KEY = "mapa-strediska-workspace-v1";
+const VIEW_STATE_KEY = `${EDITOR_STORAGE_PREFIX}-workspace-v1`;
 const STRUCTURE_LAYOUT_VERSION = 44;
 const PEOPLE_CLUSTER_BUFFER = 220;
 const CROSS_GROUP_PERSON_BUFFER = 130;
@@ -445,7 +451,7 @@ function renderShell() {
         <section class="view sql-view" id="sql-view">
           <div class="sql-layout">
             <article class="panel query-panel">
-              <div class="panel-head"><div><span class="eyebrow">Dotaz</span><h2>Datový průzkumník</h2></div><span class="db-status"><i class="db-dot"></i> read only</span></div>
+              <div class="panel-head"><div><span class="eyebrow">Dotaz</span><h2>Datový průzkumník</h2></div><span class="db-status"><i class="db-dot"></i> SELECT + editace</span></div>
               <details class="sql-builder" id="sql-builder" open>
                 <summary><span><b>Průvodce dotazem</b><small>Bez znalosti SQL</small></span><span class="builder-summary" id="sql-builder-summary">Seznam všech lidí</span></summary>
                 <div class="sql-builder-body">
@@ -468,6 +474,7 @@ function renderShell() {
                 </div>
               </details>
               <div class="query-wrap"><textarea id="sql-query" class="query-editor" spellcheck="false" aria-label="SQL dotaz">SELECT
+  p.id AS __person_id,
   p.name AS jmeno,
   p.nickname AS prezdivka,
   p.role AS role,
@@ -484,11 +491,11 @@ LEFT JOIN people_tags pt ON pt.person_id = p.id
 LEFT JOIN tags t ON t.id = pt.tag_id
 GROUP BY p.id
 ORDER BY p.name;</textarea></div>
-              <div class="query-footer"><span class="query-note">Ctrl / ⌘ + Enter</span><button class="primary-button" id="run-query">Spustit SELECT →</button></div>
+              <div class="query-footer"><span class="query-note">Ctrl / ⌘ + Enter · __person_id zpřístupní úpravy řádku</span><button class="primary-button" id="run-query">Spustit SELECT →</button></div>
               <div class="preset-row"><button class="preset" data-preset="all">všichni lidé</button><button class="preset" data-preset="young">do 30 let</button><button class="preset" data-preset="category">podle kategorií</button><button class="preset" data-preset="tags">nejčastější štítky</button></div>
             </article>
             <article class="panel result-panel">
-              <div class="panel-head"><div><span class="eyebrow">Výsledek</span><h2>Tabulka</h2></div><span id="result-meta" class="result-meta">Připraveno</span></div>
+              <div class="panel-head result-panel-head"><div><span class="eyebrow">Výsledek</span><h2>Tabulka</h2></div><div class="result-head-actions"><span id="result-meta" class="result-meta">Připraveno</span><button type="button" class="secondary-button compact-button" id="sql-add-person">+ Přidat člověka</button></div></div>
               <div class="result-wrap" id="result-wrap"><div class="empty-result"><div><b>Čekám na dotaz</b>Výsledek SELECTu se objeví tady.</div></div></div>
             </article>
           </div>
@@ -534,23 +541,40 @@ ORDER BY p.name;</textarea></div>
   `;
 }
 
-function openStore() {
+function openStore(databaseName = EDITOR_DATABASE_NAME) {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open("mapa-strediska", 1);
-    request.onupgradeneeded = () => request.result.createObjectStore("sqlite");
+    const request = indexedDB.open(databaseName, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains("sqlite")) request.result.createObjectStore("sqlite");
+    };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
 }
 
 async function loadSavedDatabase() {
-  const store = await openStore();
-  return new Promise((resolve, reject) => {
-    const tx = store.transaction("sqlite", "readonly");
-    const request = tx.objectStore("sqlite").get("main");
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
+  const readStoredBytes = async databaseName => {
+    const store = await openStore(databaseName);
+    return new Promise((resolve, reject) => {
+      const tx = store.transaction("sqlite", "readonly");
+      const request = tx.objectStore("sqlite").get("main");
+      request.onsuccess = () => { store.close(); resolve(request.result); };
+      request.onerror = () => { store.close(); reject(request.error); };
+    });
+  };
+  const saved = await readStoredBytes(EDITOR_DATABASE_NAME);
+  if (saved) return saved;
+  // One-time compatibility path: preserve the last database snapshot, but do
+  // not inherit the legacy theme/layout keys that caused cross-app rendering.
+  try {
+    if (typeof indexedDB.databases === "function") {
+      const databases = await indexedDB.databases();
+      if (!databases.some(item => item.name === LEGACY_DATABASE_NAME)) return null;
+    }
+    return await readStoredBytes(LEGACY_DATABASE_NAME);
+  } catch (_) {
+    return null;
+  }
 }
 
 async function persistDatabase() {
@@ -562,6 +586,7 @@ async function persistDatabase() {
     tx.oncomplete = resolve;
     tx.onerror = () => reject(tx.error);
   });
+  store.close();
   document.querySelector("#db-size").textContent = `${Math.ceil(bytes.length / 1024)} KB`;
 }
 
@@ -5732,6 +5757,7 @@ WHERE ${where.join("\n  AND ")}`;
       city: "p.city COLLATE NOCASE, p.name COLLATE NOCASE"
     }[state.order] || "p.name COLLATE NOCASE, p.id";
     return `${cte}SELECT
+  p.id AS __person_id,
   p.name AS jmeno,
   p.nickname AS prezdivka,
   p.role AS role,
@@ -5811,14 +5837,19 @@ function openUnitPeopleInSql(teamId) {
   hideUnitActionPopover();
 }
 
+function sqlResultPersonIdColumn(columns) {
+  return columns.findIndex(column => ["__person_id", "person_id"].includes(String(column || "").trim().toLocaleLowerCase("en")));
+}
+
 function runSelect() {
   const sql = document.querySelector("#sql-query").value.trim();
   const output = document.querySelector("#result-wrap");
   const meta = document.querySelector("#result-meta");
   const executableSql = sql.replace(/'(?:''|[^'])*'/g, "''").replace(/--.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
   if (!/^(select|with)\b/i.test(executableSql.trim()) || /\b(insert|update|delete|drop|alter|create|replace|attach|detach|vacuum)\b/i.test(executableSql)) {
-    output.innerHTML = '<div class="error-box">Tato konzole přijímá pouze bezpečné SELECT dotazy. Změny lidí provádějte přes formulář „Přidat člověka“.</div>';
+    output.innerHTML = '<div class="error-box">Tato konzole přijímá pouze bezpečné SELECT dotazy. Lidi můžete přidat nebo upravit přímo z výsledné tabulky.</div>';
     meta.textContent = "Dotaz odmítnut";
+    lastSqlResult = null;
     return;
   }
   const started = performance.now();
@@ -5827,26 +5858,62 @@ function runSelect() {
     if (!results.length) {
       output.innerHTML = '<div class="empty-result"><div><b>0 řádků</b>Dotaz proběhl v pořádku, ale nic nenašel.</div></div>';
       meta.textContent = `0 řádků · ${Math.round(performance.now()-started)} ms`;
+      lastSqlResult = {sql, columns: [], values: []};
       return;
     }
     const {columns, values} = results[0];
+    const personIdColumn = sqlResultPersonIdColumn(columns);
+    const visibleColumnIndexes = columns.map((_, index) => index).filter(index => index !== personIdColumn);
+    const canEditPeople = personIdColumn >= 0;
     const table = document.createElement("table");
-    table.className = "result-table";
+    table.className = `result-table${canEditPeople ? " is-editable" : ""}`;
     const thead = table.createTHead().insertRow();
-    columns.forEach(c => { const th = document.createElement("th"); th.textContent = c; thead.appendChild(th); });
+    visibleColumnIndexes.forEach(index => { const th = document.createElement("th"); th.textContent = columns[index]; thead.appendChild(th); });
+    if (canEditPeople) {
+      const actionHead = document.createElement("th");
+      actionHead.className = "result-action-column";
+      actionHead.textContent = "Úpravy";
+      thead.appendChild(actionHead);
+    }
     const tbody = table.createTBody();
-    values.forEach(row => { const tr = tbody.insertRow(); row.forEach(value => { const td = tr.insertCell(); td.textContent = value ?? "—"; td.title = String(value ?? ""); }); });
-    output.replaceChildren(table);
-    meta.textContent = `${values.length} ${values.length === 1 ? "řádek" : "řádků"} · ${Math.round(performance.now()-started)} ms`;
+    values.forEach(row => {
+      const tr = tbody.insertRow();
+      const personId = personIdColumn >= 0 ? Number(row[personIdColumn]) : null;
+      const personExists = Number.isInteger(personId) && people.some(person => person.id === personId);
+      if (personExists) tr.dataset.personId = String(personId);
+      visibleColumnIndexes.forEach(index => {
+        const value = row[index];
+        const td = tr.insertCell();
+        td.textContent = value ?? "—";
+        td.title = String(value ?? "");
+      });
+      if (canEditPeople) {
+        const actionCell = tr.insertCell();
+        actionCell.className = "result-row-actions";
+        if (personExists) actionCell.innerHTML = `<button type="button" class="result-edit-button" data-sql-edit-person="${personId}" aria-label="Upravit člověka v tomto řádku">Upravit</button>`;
+        else actionCell.textContent = "—";
+      }
+    });
+    const fragment = document.createDocumentFragment();
+    const notice = document.createElement("div");
+    notice.className = `result-edit-notice ${canEditPeople ? "is-active" : ""}`;
+    notice.innerHTML = canEditPeople
+      ? '<span>Řádky jsou propojené s databází.</span><b>Upravte člověka tlačítkem vpravo.</b>'
+      : '<span>Výsledek je pouze pro čtení.</span><b>Pro úpravy osoby přidejte do SELECTu <code>p.id AS __person_id</code>.</b>';
+    fragment.append(notice, table);
+    output.replaceChildren(fragment);
+    lastSqlResult = {sql, columns, values, canEditPeople};
+    meta.textContent = `${values.length} ${values.length === 1 ? "řádek" : "řádků"} · ${canEditPeople ? "lze upravit" : "náhled"} · ${Math.round(performance.now()-started)} ms`;
   } catch (error) {
     output.innerHTML = `<div class="error-box">${escapeHtml(error.message)}</div>`;
     meta.textContent = "Chyba v dotazu";
+    lastSqlResult = null;
   }
 }
 
 const presets = {
-  all: `SELECT p.name AS jmeno, p.nickname AS prezdivka, p.role, p.birth_date AS datum_narozeni, c.name AS kategorie, p.registration_category AS registracni_kategorie, ot.name AS primarni_jednotka,\n  (SELECT GROUP_CONCAT(o.name, ', ') FROM people_teams pom JOIN teams o ON o.id=pom.team_id WHERE pom.person_id=p.id) AS jednotky,\n  GROUP_CONCAT(t.name, ', ') AS stitky\nFROM people p\nLEFT JOIN categories c ON c.id = p.category_id\nLEFT JOIN teams ot ON ot.id = p.org_team_id\nLEFT JOIN people_tags pt ON pt.person_id = p.id\nLEFT JOIN tags t ON t.id = pt.tag_id\nGROUP BY p.id\nORDER BY p.name;`,
-  young: `SELECT p.name AS jmeno, p.age AS vek, p.role, ot.name AS primarni_jednotka,\n  (SELECT GROUP_CONCAT(o.name, ', ') FROM people_teams pom JOIN teams o ON o.id=pom.team_id WHERE pom.person_id=p.id) AS jednotky\nFROM people p\nLEFT JOIN teams ot ON ot.id = p.org_team_id\nWHERE p.age <= 30\nORDER BY p.age;`,
+  all: `SELECT p.id AS __person_id, p.name AS jmeno, p.nickname AS prezdivka, p.role, p.birth_date AS datum_narozeni, c.name AS kategorie, p.registration_category AS registracni_kategorie, ot.name AS primarni_jednotka,\n  (SELECT GROUP_CONCAT(o.name, ', ') FROM people_teams pom JOIN teams o ON o.id=pom.team_id WHERE pom.person_id=p.id) AS jednotky,\n  GROUP_CONCAT(t.name, ', ') AS stitky\nFROM people p\nLEFT JOIN categories c ON c.id = p.category_id\nLEFT JOIN teams ot ON ot.id = p.org_team_id\nLEFT JOIN people_tags pt ON pt.person_id = p.id\nLEFT JOIN tags t ON t.id = pt.tag_id\nGROUP BY p.id\nORDER BY p.name;`,
+  young: `SELECT p.id AS __person_id, p.name AS jmeno, p.age AS vek, p.role, ot.name AS primarni_jednotka,\n  (SELECT GROUP_CONCAT(o.name, ', ') FROM people_teams pom JOIN teams o ON o.id=pom.team_id WHERE pom.person_id=p.id) AS jednotky\nFROM people p\nLEFT JOIN teams ot ON ot.id = p.org_team_id\nWHERE p.age <= 30\nORDER BY p.age;`,
   category: `SELECT c.name AS kategorie, COUNT(p.id) AS pocet_lidi, ROUND(AVG(p.age), 1) AS prumerny_vek\nFROM categories c\nLEFT JOIN people p ON p.category_id = c.id\nGROUP BY c.id\nORDER BY pocet_lidi DESC;`,
   tags: `SELECT t.name AS stitek, COUNT(pt.person_id) AS pocet_lidi\nFROM tags t\nLEFT JOIN people_tags pt ON pt.tag_id = t.id\nGROUP BY t.id\nORDER BY pocet_lidi DESC, t.name;`
 };
@@ -5992,6 +6059,7 @@ function closePersonModal() { document.querySelector("#person-modal").classList.
 async function savePerson(event) {
   event.preventDefault();
   const wasEditing = Boolean(editingId);
+  const refreshSqlResult = activeSection === "sql" && Boolean(lastSqlResult?.sql);
   const form = new FormData(event.currentTarget);
   const orgTeamValue = form.get("org_team_id");
   const categoryValue = form.get("category_id");
@@ -6030,6 +6098,7 @@ async function savePerson(event) {
     renderGraphV2();
     renderEditDashboard();
     closePersonModal();
+    if (refreshSqlResult) runSelect();
     showToast(wasEditing ? "Změny jsou uložené." : "Nový člověk je na mapě.");
   } catch (error) {
     db.run("ROLLBACK");
@@ -6622,6 +6691,11 @@ function bindEvents() {
   document.querySelector("#build-query").addEventListener("click", () => createQueryFromBuilder(false));
   document.querySelector("#build-run-query").addEventListener("click", () => createQueryFromBuilder(true));
   document.querySelector("#run-query").addEventListener("click", runSelect);
+  document.querySelector("#sql-add-person").addEventListener("click", () => openPersonModal());
+  document.querySelector("#result-wrap").addEventListener("click", event => {
+    const editButton = event.target.closest("[data-sql-edit-person]");
+    if (editButton) openPersonModal(+editButton.dataset.sqlEditPerson);
+  });
   document.querySelector("#sql-query").addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) runSelect(); });
   document.querySelectorAll(".preset").forEach(b => b.addEventListener("click", () => { document.querySelector("#sql-query").value = presets[b.dataset.preset]; runSelect(); }));
   document.querySelector("#export-db").addEventListener("click", exportDatabase);
