@@ -55,11 +55,20 @@ const seed = {
 
 const app = document.querySelector("#app");
 const THEME_KEY = "mapa-strediska-theme";
+const APP_SETTINGS_KEY = "mapa-strediska-app-settings-v1";
+const DEFAULT_APP_SETTINGS = {textScale: 1, background: "", reducedMotion: false};
 const themeMedia = window.matchMedia("(prefers-color-scheme: dark)");
 let themePreference = "system";
+let appSettings = {...DEFAULT_APP_SETTINGS};
 try {
   const savedTheme = localStorage.getItem(THEME_KEY);
   if (["system", "light", "dark"].includes(savedTheme)) themePreference = savedTheme;
+  const savedSettings = JSON.parse(localStorage.getItem(APP_SETTINGS_KEY) || "null");
+  if (savedSettings && typeof savedSettings === "object") {
+    if (Number.isFinite(savedSettings.textScale)) appSettings.textScale = Math.min(1.25, Math.max(.85, savedSettings.textScale));
+    if (typeof savedSettings.background === "string" && /^(?:#[0-9a-f]{6})?$/i.test(savedSettings.background)) appSettings.background = savedSettings.background;
+    if (typeof savedSettings.reducedMotion === "boolean") appSettings.reducedMotion = savedSettings.reducedMotion;
+  }
 } catch (_) {}
 
 function resolvedTheme(preference = themePreference) {
@@ -67,23 +76,60 @@ function resolvedTheme(preference = themePreference) {
 }
 
 function syncThemeControl() {
-  const button = document.querySelector("#theme-toggle");
-  if (!button) return;
-  const labels = {system: "Systém", light: "Světlý", dark: "Tmavý"};
-  const next = {system: "light", light: "dark", dark: "system"};
-  const resolved = resolvedTheme();
-  button.innerHTML = `${icons[`theme${themePreference[0].toUpperCase()}${themePreference.slice(1)}`]}<span>${labels[themePreference]}</span>`;
-  button.dataset.resolvedTheme = resolved;
-  button.setAttribute("aria-label", `Motiv: ${labels[themePreference]}. Přepnout na ${labels[next[themePreference]].toLocaleLowerCase("cs")}.`);
-  button.title = button.getAttribute("aria-label");
+  const select = document.querySelector("#app-theme-setting");
+  if (select) select.value = themePreference;
+}
+
+function syncAppSettingsControls() {
+  syncThemeControl();
+  const scale = document.querySelector("#app-text-scale");
+  const scaleOutput = document.querySelector("#app-text-scale-output");
+  const background = document.querySelector("#app-background-color");
+  const reducedMotion = document.querySelector("#app-reduced-motion");
+  if (scale) scale.value = String(Math.round(appSettings.textScale * 100));
+  if (scaleOutput) scaleOutput.textContent = `${Math.round(appSettings.textScale * 100)} %`;
+  if (background) background.value = appSettings.background || (resolvedTheme() === "dark" ? "#0d1210" : "#f4f2eb");
+  if (reducedMotion) reducedMotion.checked = appSettings.reducedMotion;
+}
+
+function backgroundTone(color) {
+  const match = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(color || "");
+  if (!match) return "";
+  const channels = match.slice(1).map(value => {
+    const channel = parseInt(value, 16) / 255;
+    return channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4;
+  });
+  return channels[0] * .2126 + channels[1] * .7152 + channels[2] * .0722 < .34 ? "dark" : "light";
+}
+
+function applyAppSettings(syncControls = true) {
+  const scale = Math.min(1.25, Math.max(.85, Number(appSettings.textScale) || 1));
+  app.style.zoom = String(scale);
+  app.style.width = `${100 / scale}%`;
+  app.style.height = `${100 / scale}%`;
+  if (appSettings.background) {
+    document.documentElement.style.setProperty("--app-background", appSettings.background);
+    document.documentElement.dataset.appBackgroundTone = backgroundTone(appSettings.background);
+  } else {
+    document.documentElement.style.removeProperty("--app-background");
+    delete document.documentElement.dataset.appBackgroundTone;
+  }
+  document.documentElement.classList.toggle("reduce-motion", appSettings.reducedMotion);
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", appSettings.background || (resolvedTheme() === "dark" ? "#0d1210" : "#f4f2eb"));
+  if (syncControls) syncAppSettingsControls();
+}
+
+function saveAppSettings() {
+  try { localStorage.setItem(APP_SETTINGS_KEY, JSON.stringify(appSettings)); } catch (_) {}
+  applyAppSettings();
 }
 
 function applyTheme(preference = themePreference, syncControl = true) {
   const resolved = resolvedTheme(preference);
   document.documentElement.dataset.theme = resolved;
   document.documentElement.dataset.themePreference = preference;
-  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", resolved === "dark" ? "#0d1210" : "#f4f2eb");
-  if (syncControl) syncThemeControl();
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", appSettings.background || (resolved === "dark" ? "#0d1210" : "#f4f2eb"));
+  if (syncControl) syncAppSettingsControls();
 }
 
 function setThemePreference(preference) {
@@ -93,8 +139,12 @@ function setThemePreference(preference) {
 }
 
 applyTheme(themePreference, false);
+applyAppSettings(false);
 themeMedia.addEventListener("change", () => {
-  if (themePreference === "system") applyTheme("system");
+  if (themePreference === "system") {
+    applyTheme("system");
+    applyAppSettings();
+  }
 });
 
 let db;
@@ -144,7 +194,7 @@ const CLUSTER_CLEAR_GAP = 210;
 const DEPARTMENT_CLEAR_GAP = 320;
 const ODDIL_FIELD_NODE_CLEARANCE = 22;
 const DEFAULT_PHYSICS = {center: .16, repel: 10, linkForce: .35, linkDistance: 110};
-let physicsSettings = {...DEFAULT_PHYSICS};
+const physicsSettings = {...DEFAULT_PHYSICS};
 const DEFAULT_CONNECTION_FILTERS = {hierarchy: true, assignment: true, membership: true, relationship: true};
 let connectionFilters = {...DEFAULT_CONNECTION_FILTERS};
 let hiddenRelationshipTypes = [];
@@ -161,8 +211,8 @@ let pinnedOddilReachName = null;
 let selectedUnitActionId = null;
 let graphFilterFrame;
 let graphFitTimer;
-let physicsUpdateFrame;
 let spreadsheetImportState = null;
+let lastSqlResult = null;
 let graphViewport = {width: 1000, height: 650};
 let stableSimulationTicks = 0;
 let personTagSuggestionIndex = -1;
@@ -173,7 +223,10 @@ const icons = {
   sql: '<svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
   edit: '<svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 20h4l11-11-4-4L4 16z"/><path d="m13.5 6.5 4 4M4 4h6M4 9h4"/></svg>',
   search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>',
-  physics: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 6h10M18 6h2M4 12h3M11 12h9M4 18h8M16 18h4"/><circle cx="16" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="14" cy="18" r="2"/></svg>',
+  structure: '<svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="5" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M12 7.5v4M6 15.5v-4h12v4"/></svg>',
+  field: '<svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="9" cy="11" r="6"/><circle cx="15" cy="11" r="6"/><circle cx="12" cy="16" r="5"/></svg>',
+  age: '<svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 19h16M5 16l4-5 4 2 6-8"/><circle cx="5" cy="16" r="1.5"/><circle cx="9" cy="11" r="1.5"/><circle cx="13" cy="13" r="1.5"/><circle cx="19" cy="5" r="1.5"/></svg>',
+  settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 6h10M18 6h2M4 12h3M11 12h9M4 18h8M16 18h4"/><circle cx="16" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="14" cy="18" r="2"/></svg>',
   filter: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h16l-6.2 7.1v5.2l-3.6 1.8v-7z"/></svg>',
   export: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M5 15v5h14v-5"/></svg>',
   themeSystem: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
@@ -197,11 +250,9 @@ function loadWorkspaceState() {
     if (!saved.zooms && saved.zoom && [saved.zoom.x, saved.zoom.y, saved.zoom.k].every(Number.isFinite)) savedZoomByMode[currentMode] = {...saved.zoom};
     savedZoom = {...savedZoomByMode[currentMode]};
     needsInitialStructureFit = saved.structureLayoutVersion !== STRUCTURE_LAYOUT_VERSION;
-    Object.keys(DEFAULT_PHYSICS).forEach(key => {
-      if (Number.isFinite(saved.physicsSettings?.[key])) physicsSettings[key] = saved.physicsSettings[key];
-    });
     Object.keys(displayOptions).forEach(key => { if (typeof saved.displayOptions?.[key] === "boolean") displayOptions[key] = saved.displayOptions[key]; });
     Object.keys(DEFAULT_CONNECTION_FILTERS).forEach(key => { if (typeof saved.connectionFilters?.[key] === "boolean") connectionFilters[key] = saved.connectionFilters[key]; });
+    syncConnectionDisplayOptions();
     if (Array.isArray(saved.hiddenRelationshipTypes)) hiddenRelationshipTypes = saved.hiddenRelationshipTypes.map(String);
     if (saved.graphFilters && typeof saved.graphFilters === "object") {
       graphFilters.unitId = saved.graphFilters.unitId == null ? "" : String(saved.graphFilters.unitId);
@@ -236,7 +287,7 @@ function captureGraphPositions(mode = currentMode) {
 function persistWorkspaceState(capture = false) {
   if (capture) captureGraphPositions();
   try {
-    localStorage.setItem(VIEW_STATE_KEY, JSON.stringify({mode: currentMode, fieldDimension, selectedFieldTagIds, section: activeSection, searchTerm, displayOptions, physicsSettings, connectionFilters, hiddenRelationshipTypes, graphFilters, colorRules, graphColorMode, positions: positionCache, zoom: savedZoom, zooms: savedZoomByMode, structureLayoutVersion: needsInitialStructureFit ? null : STRUCTURE_LAYOUT_VERSION}));
+    localStorage.setItem(VIEW_STATE_KEY, JSON.stringify({mode: currentMode, fieldDimension, selectedFieldTagIds, section: activeSection, searchTerm, displayOptions, connectionFilters, hiddenRelationshipTypes, graphFilters, colorRules, graphColorMode, positions: positionCache, zoom: savedZoom, zooms: savedZoomByMode, structureLayoutVersion: needsInitialStructureFit ? null : STRUCTURE_LAYOUT_VERSION}));
   } catch (_) {}
 }
 
@@ -245,30 +296,14 @@ function scheduleWorkspaceState() {
   workspaceSaveTimer = setTimeout(() => persistWorkspaceState(false), 160);
 }
 
-function updatePhysicsOutput(key) {
-  const output = document.querySelector(`[data-physics-output="${key}"]`);
-  if (!output) return;
-  const value = physicsSettings[key];
-  output.textContent = key === "linkDistance" ? `${Math.round(value)} px` : key === "repel" ? value.toFixed(1) : value.toFixed(2);
-}
-
-function schedulePhysicsUpdate() {
-  cancelAnimationFrame(physicsUpdateFrame);
-  physicsUpdateFrame = requestAnimationFrame(() => {
-    updateModeV2(currentMode, false);
-    if (currentMode === "network") simulation?.alpha(Math.max(simulation.alpha(), .28)).restart();
-    persistWorkspaceState(false);
-  });
+function syncConnectionDisplayOptions() {
+  displayOptions.primary = connectionFilters.hierarchy || connectionFilters.assignment || connectionFilters.membership;
+  displayOptions.secondary = connectionFilters.relationship;
 }
 
 function syncWorkspaceControls() {
-  document.querySelectorAll(".mode-button").forEach(button => button.classList.toggle("active", button.dataset.mode === currentMode));
+  syncNavigationState();
   document.querySelectorAll(".field-button").forEach(button => button.classList.toggle("active", button.dataset.field === fieldDimension));
-  document.querySelectorAll("[data-option]").forEach(input => { input.checked = displayOptions[input.dataset.option]; });
-  document.querySelectorAll("[data-physics]").forEach(input => {
-    input.value = physicsSettings[input.dataset.physics];
-    updatePhysicsOutput(input.dataset.physics);
-  });
   const search = document.querySelector("#search");
   if (search) search.value = searchTerm;
 }
@@ -338,9 +373,12 @@ function renderShell() {
         <div class="brand"><div class="brand-mark">M</div><div class="brand-copy"><strong>Mapa lidí</strong><span>středisko</span></div></div>
         <div class="nav-label">Pohled</div>
         <nav class="nav-list" aria-label="Hlavní navigace">
-          <button class="nav-button active" data-section="map">${icons.map}<span>Vizuální mapa</span></button>
-          <button class="nav-button" data-section="edit">${icons.edit}<span>Editace</span></button>
+          <button class="nav-button active" data-section="map" data-map-mode="network">${icons.structure}<span>Struktura</span></button>
+          <button class="nav-button" data-section="map" data-map-mode="field">${icons.field}<span>Field</span></button>
+          <button class="nav-button" data-section="map" data-map-mode="age">${icons.age}<span>Věk</span></button>
+          <span class="nav-divider" aria-hidden="true"></span>
           <button class="nav-button" data-section="sql">${icons.sql}<span>SQL laboratoř</span></button>
+          <button class="nav-button" data-section="edit">${icons.edit}<span>Editace</span></button>
         </nav>
         <div class="sidebar-spacer"></div>
         <div class="db-card">
@@ -349,6 +387,16 @@ function renderShell() {
           <div class="db-actions"><button class="text-button" id="import-db" type="button">Načíst .sqlite</button><button class="text-button" id="export-db" type="button">Exportovat .sqlite</button></div>
           <input id="import-db-file" type="file" accept=".sqlite,.sqlite3,.db,application/vnd.sqlite3" hidden>
         </div>
+        <details class="app-settings" id="app-settings">
+          <summary>${icons.settings}<span>Nastavení aplikace</span></summary>
+          <div class="app-settings-body">
+            <label><span>Motiv</span><select id="app-theme-setting"><option value="system">Podle systému</option><option value="light">Světlý</option><option value="dark">Tmavý</option></select></label>
+            <label><span>Velikost textu <output id="app-text-scale-output">100 %</output></span><input id="app-text-scale" type="range" min="85" max="125" step="5" value="100"></label>
+            <label><span>Barva pozadí</span><span class="setting-color-row"><input id="app-background-color" type="color" value="#f4f2eb"><button type="button" id="reset-app-background" class="text-button">Podle motivu</button></span></label>
+            <label class="setting-check"><input id="app-reduced-motion" type="checkbox"><span>Omezit animace</span></label>
+            <button type="button" class="settings-reset" id="reset-app-settings">Obnovit vzhled</button>
+          </div>
+        </details>
         <div class="build-note">MAPA / 01 · 2026</div>
       </aside>
       <main class="workspace">
@@ -356,32 +404,17 @@ function renderShell() {
           <div class="title-block"><span class="eyebrow" id="section-kicker">Interaktivní přehled</span><h1 id="section-title">Kdo tvoří středisko</h1></div>
           <div class="top-actions">
             <div class="search-wrap" role="search">${icons.search}<input id="search" class="search-input" type="search" placeholder="Hledat jméno, roli, štítek…" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="map-search-suggestions" aria-expanded="false"><span class="search-key">/</span><div class="map-search-suggestions" id="map-search-suggestions" role="listbox" hidden></div></div>
-            <button class="theme-toggle" id="theme-toggle" type="button"></button>
             <button class="primary-button" id="add-person">+ Přidat člověka</button>
           </div>
         </header>
         <section class="view map-view" id="map-view">
           <div class="map-control-dock">
-          <div class="map-toolbar" role="tablist" aria-label="Způsob rozmístění">
-            <button class="mode-button active" data-mode="network">Struktura</button>
-            <button class="mode-button" data-mode="field">Field</button>
-            <button class="mode-button" data-mode="age">Věk</button>
-            <span class="toolbar-divider"></span>
+          <div class="map-toolbar" role="toolbar" aria-label="Nástroje mapy">
             <button class="options-toggle" id="fit-map" type="button">Přizpůsobit</button>
             <button class="toolbar-icon-button filter-toggle" id="filter-toggle" type="button" aria-label="Pokročilé filtry mapy" title="Filtry a barvy" aria-expanded="false">${icons.filter}<span id="filter-count" class="filter-count" hidden>0</span></button>
-            <button class="toolbar-icon-button" id="physics-toggle" type="button" aria-label="Nastavení fyziky mapy" title="Fyzika mapy" aria-expanded="false">${icons.physics}</button>
             <button class="toolbar-icon-button" id="export-toggle" type="button" aria-label="Exportovat aktuální pohled" title="Export PDF nebo SVG" aria-expanded="false">${icons.export}</button>
-            <button class="options-toggle" id="options-toggle" type="button" aria-expanded="false">Zobrazení</button>
           </div>
           <div class="filter-panel" id="filter-panel"></div>
-          <div class="physics-panel" id="physics-panel">
-            <div class="physics-head"><div><span class="eyebrow">Fyzika grafu</span><strong>Síly mapy</strong></div><button type="button" class="text-button" id="reset-physics">Výchozí</button></div>
-            <label class="physics-control"><span>Středová síla <output data-physics-output="center"></output></span><input type="range" min="0" max="1" step="0.01" value="${physicsSettings.center}" data-physics="center"></label>
-            <label class="physics-control"><span>Odpuzování <output data-physics-output="repel"></output></span><input type="range" min="0" max="20" step="0.5" value="${physicsSettings.repel}" data-physics="repel"></label>
-            <label class="physics-control"><span>Síla spojení <output data-physics-output="linkForce"></output></span><input type="range" min="0" max="1" step="0.01" value="${physicsSettings.linkForce}" data-physics="linkForce"></label>
-            <label class="physics-control"><span>Délka spojení <output data-physics-output="linkDistance"></output></span><input type="range" min="60" max="220" step="5" value="${physicsSettings.linkDistance}" data-physics="linkDistance"></label>
-            <p>Stejné čtyři základní ovladače jako v Obsidianu. Hierarchie používá násobky zvolené délky a změny se projeví okamžitě.</p>
-          </div>
           <div class="field-toolbar" id="field-toolbar" aria-label="Pole pro seskupení">
             <span>Field:</span>
             <button class="field-button" data-field="oddil">oddíly</button>
@@ -391,14 +424,6 @@ function renderShell() {
             <button class="field-button" data-field="category">kategorie</button>
             <button class="field-button" data-field="tags">štítky</button>
             <details class="field-tag-picker" id="field-tag-picker" hidden><summary>Vybrat štítky <span id="field-tag-count"></span></summary><div class="field-tag-menu" id="field-tag-menu"></div></details>
-          </div>
-          <div class="options-panel" id="options-panel">
-            <div class="options-title">Vrstvy mapy</div>
-            <label><input type="checkbox" data-option="primary" checked><span>Primární spojení</span></label>
-            <label><input type="checkbox" data-option="secondary" checked><span>Sekundární spojení</span></label>
-            <label><input type="checkbox" data-option="tags"><span>Štítky u lidí</span></label>
-            <label><input type="checkbox" data-option="categories" checked><span>Pole / kategorie</span></label>
-            <label><input type="checkbox" data-option="titles" checked><span>Názvy střediska, oddílů a družin</span></label>
           </div>
           <div class="export-panel" id="export-panel">
             <div class="export-title"><span class="eyebrow">Aktuální pohled</span><strong>Exportovat mapu</strong></div>
@@ -2376,6 +2401,9 @@ function updateGraphFilterMeta() {
   const count = activeFilterRules().length + (graphFilters.unitId ? 1 : 0)
     + (String(graphFilters.query || "").trim() ? 1 : 0)
     + (graphFilters.showOrphans ? 0 : 1)
+    + (displayOptions.tags ? 1 : 0)
+    + (displayOptions.categories ? 0 : 1)
+    + (displayOptions.titles ? 0 : 1)
     + (graphColorMode === "group" ? 0 : 1)
     + (graphColorMode === "filter" ? colorRules.filter(rule => String(rule.value ?? "").trim()).length : 0)
     + Object.values(connectionFilters).filter(value => !value).length + hiddenRelationshipTypes.length;
@@ -2420,7 +2448,9 @@ function renderGraphFilterPanel() {
       <label class="filter-query"><span class="filter-query-icon">${icons.search}</span><input data-filter-query value="${escapeHtml(graphFilters.query || "")}" placeholder='např. role:vedoucí -město:Praha'></label>
       <p class="filter-query-help">Slova se kombinují jako „a“. Použijte <code>OR</code>, <code>-výraz</code>, přesnou frázi v uvozovkách nebo <code>štítek:</code>, <code>jednotka:</code>, <code>role:</code>, <code>město:</code>, <code>kategorie:</code> a <code>věk:&gt;=18</code>.</p>
       <div class="filter-toggle-row">
-        <label class="filter-checkbox"><input type="checkbox" data-filter-show-tags${displayOptions.tags ? " checked" : ""}><span>Zobrazit štítky</span></label>
+        <label class="filter-checkbox"><input type="checkbox" data-filter-display="tags"${displayOptions.tags ? " checked" : ""}><span>Zobrazit štítky</span></label>
+        <label class="filter-checkbox"><input type="checkbox" data-filter-display="categories"${displayOptions.categories ? " checked" : ""}><span>Zobrazit pole a zóny</span></label>
+        <label class="filter-checkbox"><input type="checkbox" data-filter-display="titles"${displayOptions.titles ? " checked" : ""}><span>Zobrazit názvy jednotek</span></label>
         <label class="filter-checkbox"><input type="checkbox" data-filter-orphans${graphFilters.showOrphans ? " checked" : ""}><span>Zobrazit lidi bez spojení</span></label>
       </div>
     </section>
@@ -3971,7 +4001,12 @@ function updateModeV2(mode, animate = true) {
     hideFieldSectionInfo();
   }
   svg.attr("data-mode", mode).attr("data-field-dimension", mode === "field" ? fieldDimension : null);
-  document.querySelectorAll(".mode-button").forEach(button => button.classList.toggle("active", button.dataset.mode === mode));
+  syncNavigationState();
+  if (activeSection === "map") {
+    const heading = mapViewHeading(mode);
+    document.querySelector("#section-kicker").textContent = heading.kicker;
+    document.querySelector("#section-title").textContent = heading.title;
+  }
   document.querySelector("#field-toolbar").classList.toggle("visible", mode === "field");
   const mapHint = document.querySelector(".map-hint");
   if (mapHint) mapHint.textContent = mode === "field" && fieldDimension === "oddil"
@@ -4356,25 +4391,47 @@ function applySearch() {
   nodeLayer?.selectAll("g.person-node").classed("is-dimmed", d => q && !mapPersonSearchText(d).includes(q));
 }
 
-function showSection(section) {
+function syncNavigationState(section = activeSection, mode = currentMode) {
+  document.querySelectorAll(".nav-button").forEach(button => {
+    const active = section === "map"
+      ? button.dataset.section === "map" && button.dataset.mapMode === mode
+      : button.dataset.section === section && !button.dataset.mapMode;
+    button.classList.toggle("active", active);
+    if (active) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  });
+}
+
+function mapViewHeading(mode) {
+  if (mode === "field") return {kicker: "Datová pole", title: "Field pohled"};
+  if (mode === "age") return {kicker: "Věkové rozložení", title: "Věk členů"};
+  return {kicker: "Mapa střediska", title: "Struktura"};
+}
+
+function showSection(section, requestedMode = null) {
   activeSection = section;
-  document.querySelectorAll(".nav-button").forEach(b => b.classList.toggle("active", b.dataset.section === section));
   const isMap = section === "map";
   const isEdit = section === "edit";
+  const targetMode = requestedMode || currentMode;
+  syncNavigationState(section, targetMode);
   document.querySelector("#map-view").style.display = isMap ? "block" : "none";
   document.querySelector("#edit-view").style.display = isEdit ? "block" : "none";
   document.querySelector("#sql-view").style.display = section === "sql" ? "block" : "none";
   document.querySelector("#search").closest(".search-wrap").style.display = isMap ? "block" : "none";
   document.querySelector("#add-person").style.display = section === "sql" ? "none" : "inline-flex";
-  document.querySelector("#section-kicker").textContent = isMap ? "Interaktivní přehled" : isEdit ? "Správa databáze" : "SQLite databáze";
-  document.querySelector("#section-title").textContent = isMap ? "Kdo tvoří středisko" : isEdit ? "Editační dashboard" : "Ptejte se dat";
+  const heading = mapViewHeading(targetMode);
+  document.querySelector("#section-kicker").textContent = isMap ? heading.kicker : isEdit ? "Správa databáze" : "SQLite databáze";
+  document.querySelector("#section-title").textContent = isMap ? heading.title : isEdit ? "Editační dashboard" : "Ptejte se dat";
   if (!isMap) {
     simulation?.stop();
     hideMapSearchSuggestions();
     hideUnitActionPopover();
   }
   if (isEdit) renderEditDashboard();
-  if (isMap) setTimeout(() => updateModeV2(currentMode, false), 20);
+  if (isMap) setTimeout(() => {
+    updateModeV2(targetMode, requestedMode != null);
+    syncNavigationState();
+  }, 20);
   persistWorkspaceState(true);
 }
 
@@ -4494,7 +4551,7 @@ function renderEditDashboard() {
           <span class="dropzone-mark" aria-hidden="true">#</span>
           <span><b>Kurzy a kvalifikace</b><small>Přetáhněte .xlsx nebo klikněte</small></span>
         </button>
-        <div class="spreadsheet-copy"><b>Vytvořit a přiřadit štítky</b><p>Sloupec B určuje název štítku. Druhý řádek s roky se ignoruje; od sloupce C se načtou jména ze seznamů s odrážkami. Před uložením uvidíte nalezené i nerozpoznané lidi.</p><span>B = štítek · řádek 2 = ignorovat · C a dále = lidé</span></div>
+        <div class="spreadsheet-copy"><b>Vytvořit a přiřadit štítky</b><p>Sloupec B určuje název štítku. Druhý řádek s roky se ignoruje; od sloupce C se automaticky načtou jména z odrážkových seznamů i z prostých seznamů oddělených čárkami, středníky nebo řádky.</p><span>B = štítek · řádek 2 = ignorovat · C a dále = lidé</span></div>
         <input id="tag-matrix-file" type="file" multiple accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden>
       </div>
     </article>
@@ -4962,19 +5019,62 @@ async function parseCustomSkautisFiles(files) {
   return [...merged.values()];
 }
 
+function cleanTagMatrixName(value) {
+  return String(value ?? "")
+    .replace(/^\s*(?:[•▪◦‣·●○■□►▸➤✓✔]+|[-–—*.]+|\d+[.)])\s*/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function validTagMatrixName(value) {
+  return Boolean(value
+    && !/^(?:[-–—.]{2,}|bez|nikdo)$/i.test(value)
+    && !/^(?:19|20)\d{2}$/.test(value));
+}
+
+function tagMatrixNameMatchScore(names) {
+  return names.reduce((score, rawName) => {
+    const parsed = {...parseExportedName(rawName), rawName};
+    return score + (matchTagMatrixPerson(parsed) ? 1 : 0);
+  }, 0);
+}
+
+function splitTagMatrixCommaNames(value) {
+  const whole = cleanTagMatrixName(value);
+  const parts = whole.split(",").map(cleanTagMatrixName).filter(validTagMatrixName);
+  if (parts.length < 2) return validTagMatrixName(whole) ? [whole] : [];
+
+  const wholeScore = tagMatrixNameMatchScore([whole]);
+  const splitScore = tagMatrixNameMatchScore(parts);
+  const paired = parts.length > 2 && parts.length % 2 === 0
+    ? Array.from({length: parts.length / 2}, (_, index) => `${parts[index * 2]}, ${parts[index * 2 + 1]}`)
+    : [];
+  const pairedScore = paired.length ? tagMatrixNameMatchScore(paired) : 0;
+
+  if (splitScore > wholeScore && splitScore >= pairedScore) return parts;
+  if (pairedScore > wholeScore && pairedScore > splitScore) return paired;
+  if (wholeScore) return [whole];
+  if (parts.every(part => part.split(/\s+/).length > 1)) return parts;
+  if (parts.length === 2 && parts.every(part => !part.includes(" "))) return [whole];
+  if (paired.length && parts.every(part => !part.includes(" "))) return paired;
+  return parts;
+}
+
 function parseTagMatrixNames(value) {
   const text = String(value ?? "").replace(/\r/g, "\n").trim();
   if (!text) return [];
-  return text
-    .replace(/[•▪◦‣·●○■□►▸➤✓✔]\s*/g, "\n")
-    .split(/\n+/)
-    .map(name => name
-      .replace(/^\s*(?:[-–—*·]+|\d+[.)])\s*/, "")
-      .replace(/\s+/g, " ")
-      .trim())
-    .filter(name => name
-      && !/^(?:[-–—.]{2,}|bez|nikdo)$/i.test(name)
-      && !/^(?:19|20)\d{2}$/.test(name));
+  const hasBulletList = /[•▪◦‣·●○■□►▸➤✓✔]/.test(text)
+    || /(?:^|\n)\s*(?:[-–—*.]|\d+[.)])\s+\S/m.test(text);
+  const names = hasBulletList
+    ? text
+      .replace(/[•▪◦‣·●○■□►▸➤✓✔]\s*/g, "\n")
+      .replace(/(^|\n)\s*(?:[-–—*.]|\d+[.)])\s+(?=\S)/g, "\n")
+      .split(/\n+/)
+      .map(cleanTagMatrixName)
+    : text
+      .split(/[;\n]+/)
+      .flatMap(splitTagMatrixCommaNames);
+  return detailedUniqueValues(names.filter(validTagMatrixName));
 }
 
 function parseTagMatrixSheet(sheetRows, sheetName, fileName) {
@@ -5992,7 +6092,7 @@ function mapExportFilename(extension) {
 }
 
 function closeMapControlPanels() {
-  ["filter", "physics", "options", "export"].forEach(name => {
+  ["filter", "export"].forEach(name => {
     document.querySelector(`#${name}-panel`)?.classList.remove("open");
     document.querySelector(`#${name}-toggle`)?.setAttribute("aria-expanded", "false");
   });
@@ -6153,39 +6253,50 @@ function showToast(message) {
 }
 
 function bindEvents() {
-  syncThemeControl();
-  document.querySelector("#theme-toggle").addEventListener("click", () => {
-    const next = {system: "light", light: "dark", dark: "system"};
-    setThemePreference(next[themePreference]);
-  });
-  document.querySelectorAll(".nav-button").forEach(b => b.addEventListener("click", () => showSection(b.dataset.section)));
-  document.querySelectorAll(".mode-button").forEach(button => button.addEventListener("click", () => {
-    updateModeV2(button.dataset.mode);
+  applyAppSettings();
+  document.querySelector("#app-theme-setting").addEventListener("change", event => setThemePreference(event.target.value));
+  document.querySelector("#app-text-scale").addEventListener("input", event => {
+    appSettings.textScale = Math.min(1.25, Math.max(.85, +event.target.value / 100));
+    saveAppSettings();
     clearTimeout(graphFitTimer);
-    graphFitTimer = setTimeout(() => fitMapToStructure(true), 700);
+    graphFitTimer = setTimeout(() => {
+      if (activeSection === "map") {
+        updateModeV2(currentMode, false);
+        fitMapToStructure(true);
+      }
+    }, 180);
+  });
+  document.querySelector("#app-background-color").addEventListener("input", event => {
+    appSettings.background = event.target.value;
+    saveAppSettings();
+  });
+  document.querySelector("#reset-app-background").addEventListener("click", () => {
+    appSettings.background = "";
+    saveAppSettings();
+  });
+  document.querySelector("#app-reduced-motion").addEventListener("change", event => {
+    appSettings.reducedMotion = event.target.checked;
+    saveAppSettings();
+  });
+  document.querySelector("#reset-app-settings").addEventListener("click", () => {
+    appSettings = {...DEFAULT_APP_SETTINGS};
+    setThemePreference("system");
+    saveAppSettings();
+    showToast("Vzhled aplikace byl obnoven.");
+  });
+  document.querySelectorAll(".nav-button").forEach(button => button.addEventListener("click", () => {
+    showSection(button.dataset.section, button.dataset.mapMode || null);
+    if (button.dataset.mapMode) {
+      clearTimeout(graphFitTimer);
+      graphFitTimer = setTimeout(() => fitMapToStructure(true), 720);
+    }
   }));
   document.querySelector("#fit-map").addEventListener("click", () => fitMapToStructure(true));
   document.querySelector("#filter-toggle").addEventListener("click", event => {
     event.stopPropagation();
-    document.querySelector("#options-panel").classList.remove("open");
-    document.querySelector("#options-toggle").setAttribute("aria-expanded", "false");
-    document.querySelector("#physics-panel").classList.remove("open");
-    document.querySelector("#physics-toggle").setAttribute("aria-expanded", "false");
     document.querySelector("#export-panel").classList.remove("open");
     document.querySelector("#export-toggle").setAttribute("aria-expanded", "false");
     const panel = document.querySelector("#filter-panel");
-    const open = panel.classList.toggle("open");
-    event.currentTarget.setAttribute("aria-expanded", String(open));
-  });
-  document.querySelector("#physics-toggle").addEventListener("click", event => {
-    event.stopPropagation();
-    document.querySelector("#filter-panel").classList.remove("open");
-    document.querySelector("#filter-toggle").setAttribute("aria-expanded", "false");
-    document.querySelector("#options-panel").classList.remove("open");
-    document.querySelector("#options-toggle").setAttribute("aria-expanded", "false");
-    document.querySelector("#export-panel").classList.remove("open");
-    document.querySelector("#export-toggle").setAttribute("aria-expanded", "false");
-    const panel = document.querySelector("#physics-panel");
     const open = panel.classList.toggle("open");
     event.currentTarget.setAttribute("aria-expanded", String(open));
   });
@@ -6231,20 +6342,6 @@ function bindEvents() {
     updateFieldTagPickerCount();
     updateModeV2("field");
   });
-  document.querySelector("#options-toggle").addEventListener("click", event => {
-    event.stopPropagation();
-    document.querySelector("#filter-panel").classList.remove("open");
-    document.querySelector("#filter-toggle").setAttribute("aria-expanded", "false");
-    document.querySelector("#physics-panel").classList.remove("open");
-    document.querySelector("#physics-toggle").setAttribute("aria-expanded", "false");
-    document.querySelector("#export-panel").classList.remove("open");
-    document.querySelector("#export-toggle").setAttribute("aria-expanded", "false");
-    const panel = document.querySelector("#options-panel");
-    const open = panel.classList.toggle("open");
-    event.currentTarget.setAttribute("aria-expanded", String(open));
-  });
-  document.querySelector("#options-panel").addEventListener("click", event => event.stopPropagation());
-  document.querySelector("#physics-panel").addEventListener("click", event => event.stopPropagation());
   document.querySelector("#export-toggle").addEventListener("click", event => {
     event.stopPropagation();
     const panel = document.querySelector("#export-panel");
@@ -6280,8 +6377,9 @@ function bindEvents() {
       colorRules = [];
       graphColorMode = "group";
       displayOptions.tags = false;
-      const tagsOption = document.querySelector('[data-option="tags"]');
-      if (tagsOption) tagsOption.checked = false;
+      displayOptions.categories = true;
+      displayOptions.titles = true;
+      syncConnectionDisplayOptions();
       renderGraphFilterPanel();
       scheduleGraphFilterUpdate();
       showToast("Filtry mapy byly vráceny na výchozí nastavení.");
@@ -6318,17 +6416,16 @@ function bindEvents() {
     }
     else if (event.target.matches("[data-filter-descendants]")) graphFilters.includeDescendants = event.target.checked;
     else if (event.target.matches("[data-filter-orphans]")) graphFilters.showOrphans = event.target.checked;
-    else if (event.target.matches("[data-filter-show-tags]")) {
-      displayOptions.tags = event.target.checked;
-      const tagsOption = document.querySelector('[data-option="tags"]');
-      if (tagsOption) tagsOption.checked = event.target.checked;
-    }
+    else if (event.target.matches("[data-filter-display]")) displayOptions[event.target.dataset.filterDisplay] = event.target.checked;
     else if (event.target.matches("[data-filter-match]")) graphFilters.match = event.target.value;
     else if (event.target.matches("[data-color-mode]")) {
       graphColorMode = event.target.value;
       renderGraphFilterPanel();
     }
-    else if (event.target.matches("[data-connection-filter]")) connectionFilters[event.target.dataset.connectionFilter] = event.target.checked;
+    else if (event.target.matches("[data-connection-filter]")) {
+      connectionFilters[event.target.dataset.connectionFilter] = event.target.checked;
+      syncConnectionDisplayOptions();
+    }
     else if (event.target.matches("[data-relationship-type]")) {
       const type = event.target.dataset.relationshipType;
       hiddenRelationshipTypes = event.target.checked ? hiddenRelationshipTypes.filter(item => item !== type) : [...new Set([...hiddenRelationshipTypes, type])];
@@ -6349,28 +6446,6 @@ function bindEvents() {
     else return;
     scheduleGraphFilterUpdate();
   });
-  document.querySelectorAll("[data-physics]").forEach(input => input.addEventListener("input", () => {
-    physicsSettings[input.dataset.physics] = +input.value;
-    updatePhysicsOutput(input.dataset.physics);
-    schedulePhysicsUpdate();
-  }));
-  document.querySelector("#reset-physics").addEventListener("click", () => {
-    physicsSettings = {...DEFAULT_PHYSICS};
-    document.querySelectorAll("[data-physics]").forEach(input => {
-      input.value = physicsSettings[input.dataset.physics];
-      updatePhysicsOutput(input.dataset.physics);
-    });
-    schedulePhysicsUpdate();
-    showToast("Fyzika mapy byla vrácena na výchozí hodnoty.");
-  });
-  document.querySelectorAll("[data-option]").forEach(input => input.addEventListener("change", () => {
-    displayOptions[input.dataset.option] = input.checked;
-    if (input.dataset.option === "tags") {
-      const filterTags = document.querySelector("[data-filter-show-tags]");
-      if (filterTags) filterTags.checked = input.checked;
-    }
-    updateModeV2(currentMode);
-  }));
   const editDashboard = document.querySelector("#edit-dashboard");
   editDashboard.addEventListener("submit", handleEditorSubmit);
   editDashboard.addEventListener("click", handleEditorClick);
@@ -6561,10 +6636,6 @@ function bindEvents() {
     hideUnitActionPopover();
     closeExpandedPersonInfo();
     if (!event.target.closest?.(".search-wrap")) hideMapSearchSuggestions();
-    document.querySelector("#options-panel")?.classList.remove("open");
-    document.querySelector("#options-toggle")?.setAttribute("aria-expanded", "false");
-    document.querySelector("#physics-panel")?.classList.remove("open");
-    document.querySelector("#physics-toggle")?.setAttribute("aria-expanded", "false");
     document.querySelector("#filter-panel")?.classList.remove("open");
     document.querySelector("#filter-toggle")?.setAttribute("aria-expanded", "false");
     document.querySelector("#export-panel")?.classList.remove("open");
